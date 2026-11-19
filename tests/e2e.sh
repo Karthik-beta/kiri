@@ -834,6 +834,7 @@ t alpine-still-there "alpine" $D images --format '{{.Repository}}'
 t load "Loaded image: kiri-test/alp:v1" $D load -i "$IMD/a.tar"
 t load-runs "3." $D run --rm kiri-test/alp:v1 cat /etc/alpine-release
 t load-stdin "Loaded image" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; $D load < $IMD/a.tar"
+t load-gzip "Loaded image: kiri-test/alp:v1" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; gzip -c $IMD/a.tar | $D load"
 code load-garbage 1 bash -c "echo nope | $D load"
 # A hard link's target is read from the layer's root, so a leading / is the
 # layer's, as with Docker (issue 302); `..` still can't leave the layer.

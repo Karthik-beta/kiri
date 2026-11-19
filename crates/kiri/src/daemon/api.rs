@@ -570,9 +570,24 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     Ok(())
 }
 
-/// `docker load`: an image archive, streamed into the store.
+/// `docker load`: an image archive, plain or gzip-compressed as Docker
+/// accepts it, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
-    let loaded = kiri_image::archive::load(&engine.store, http::Body::new(req, r));
+    use std::io::Read;
+    let mut body = http::Body::new(req, r);
+    let mut head = Vec::with_capacity(6);
+    (&mut body).take(6).read_to_end(&mut head)?;
+    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load(&engine.store, archive));
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            // Refused from its first bytes: read the rest first, or the
+            // client, still sending, gets a broken pipe and not the reason.
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     match loaded {
         Ok(images) => {
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
@@ -2773,8 +2788,9 @@ enum Upload {
     Unsupported(&'static str),
 }
 
-/// What an archive upload is, from its first bytes. Docker accepts tar,
-/// gzip, bzip2, xz and zstd here; anything that isn't compressed is tar.
+/// What an archive upload (`docker cp` in, `docker load`) is, from its first
+/// bytes. Docker accepts tar, gzip, bzip2, xz and zstd here; anything that
+/// isn't compressed is tar.
 fn upload_compression(head: &[u8]) -> Upload {
     match head {
         [0x1f, 0x8b, ..] => Upload::Gzip,
@@ -3157,6 +3173,63 @@ mod tests {
             assert_eq!(got, plain);
         }
         assert!(matches!(upload_reader(b"BZh91A".to_vec(), &b""[..]), Err(Error::BadRequest(m)) if m.contains("bzip2")));
+    }
+
+    /// `docker save | gzip | docker load` loads, as on Docker (issue 528):
+    /// the body goes through the same detection as `docker cp` uploads.
+    /// Each archive is sent to `POST /images/load` as the CLI sends it.
+    #[test]
+    fn image_load_takes_gzip_archives() {
+        use std::io::{Read, Write};
+        let (src, engine) = engine_in("load-gzip-src", false);
+        let put = |bytes: &[u8]| {
+            let mut w = engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": ["echo", "hi"]}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let layers = vec![kiri_image::Layer { digest: layer, size, media_type: "application/vnd.docker.image.rootfs.diff.tar.gzip".into() }];
+        let image = kiri_image::archive::from_config("demo:gz".into(), &cfg, &config, layers);
+        let mut plain = Vec::new();
+        kiri_image::archive::save(&engine.store, &[image], &mut plain).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(src);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+
+        let load = |name: &str, body: &[u8]| {
+            let (root, engine) = engine_in(name, false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine)
+            });
+            write!(client, "POST /images/load?quiet=0 HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            client.write_all(body).unwrap();
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            served.join().unwrap().unwrap();
+            let found = engine.store.find("demo:gz").unwrap().map(|i| i.config_digest);
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+            (answer, found)
+        };
+        for (name, body) in [("load-gzip", &gz), ("load-plain", &plain)] {
+            let (answer, found) = load(name, body);
+            assert!(answer.starts_with("HTTP/1.1 200"), "{name}: {answer}");
+            assert!(answer.contains("Loaded image: demo:gz"), "{name}: {answer}");
+            assert_eq!(found.as_deref(), Some(cfg.as_str()), "{name}");
+        }
+        // Formats Docker takes that Kiri doesn't yet say so, not "cksum",
+        // and the client gets that answer after sending all of a big body.
+        let mut bzip2 = b"BZh91AY&SY".to_vec();
+        bzip2.resize(4 << 20, 0x5a);
+        let (answer, found) = load("load-bzip2", &bzip2);
+        assert!(answer.starts_with("HTTP/1.1 400") && answer.contains("bzip2-compressed archive isn't supported yet"), "{answer}");
+        assert_eq!(found, None);
     }
 
     /// Every damaged gzip is a 400, including the ones Docker 29 accepts
