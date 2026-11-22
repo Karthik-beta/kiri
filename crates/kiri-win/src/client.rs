@@ -193,8 +193,9 @@ pub fn get(path: &str) -> io::Result<Value> {
 }
 
 /// A GET of the window's own refresh, failing after QUICK without an answer.
+/// Marked as the window's own, so the refresh never keeps the VM awake.
 pub fn get_quick(path: &str) -> io::Result<Value> {
-    let r = request_within("GET", path, None, false, Some(QUICK))?;
+    let r = request_within("GET", path, None, true, Some(QUICK))?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
     }

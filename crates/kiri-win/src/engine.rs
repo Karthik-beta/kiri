@@ -1429,10 +1429,11 @@ fn windows_proxy() -> Value {
 
 /// Tells the daemon what Windows' proxy is. A proxy on Windows' own
 /// 127.0.0.1 (Windows' or one set in Settings → Network) is reached through
-/// the relay (relay.rs), and the daemon gets its ports too.
+/// the relay (relay.rs), and the daemon gets its ports too. Sent every
+/// minute, so marked as the window's own: it never keeps the VM awake.
 pub(crate) fn send_windows_proxy() {
     let mut body = windows_proxy();
-    let custom = client::get("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
+    let custom = client::get_background("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
     let mut targets: Vec<u16> = [&body["http"], &body["https"], &custom["http"], &custom["https"]]
         .iter()
         .filter_map(|v| v.as_str())
@@ -1442,7 +1443,7 @@ pub(crate) fn send_windows_proxy() {
     targets.dedup();
     let relay = crate::relay::ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
-    let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
+    let _ = client::request_with("PUT", "/kiri/proxy/system", Some(&body), true);
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports. The
